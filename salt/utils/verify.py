@@ -10,6 +10,13 @@ import getpass
 import socket
 import logging
 
+try:
+    import win32api as winapi
+    import win32security as winsec
+    import netsecuritycon as netsec
+except ImportError:
+    pass
+
 log = logging.getLogger(__name__)
 
 __all__ = ('zmq_version', 'verify_env', 'check_user')
@@ -77,6 +84,23 @@ def verify_socket(interface, pub_port, ret_port):
     except Exception:
         return False
 
+def verify_env_windows(dirs, username):
+    """
+    Similar to the *NIX verify, but for Windows security
+    """
+
+    userobj, domain, type = win32security.LookupAccountName("")
+    everyone, domain, type = win32security.LookupAccountName("", "Everyone")
+
+    # DACL #1: 063
+    urwx_gr = winsec.ACL()
+    urwx_gr.AddAccessAllowedAce(winsec.ACL_REVISION, netsec.FILE_GENERIC_READ, everyone)
+
+    # DACL
+
+    #for dir_ in dirs:
+    #    if not os.path.isdir(dir_):
+
 
 def verify_env(dirs, user):
     '''
@@ -85,6 +109,9 @@ def verify_env(dirs, user):
     '''
     if 'os' in os.environ:
         if os.environ['os'].startswith('Windows'):
+            for dir_ in dirs:
+                if not os.path.exists(dir_):
+                    os.makedirs(dir_)
             return True
     import pwd  # after confirming not running Windows
     try:

@@ -110,6 +110,34 @@ class SMaster(object):
             os.chmod(keyfile, 256)
             return key
 
+def _clear_old_jobs(keep_jobs, cachedir,):
+    '''
+    Clean out the old jobs
+    '''
+    if keep_jobs == 0:
+        return
+    jid_root = os.path.join(cachedir, 'jobs')
+    while True:
+        cur = "{0:%Y%m%d%H}".format(datetime.datetime.now())
+
+        for top in os.listdir(jid_root):
+            t_path = os.path.join(jid_root, top)
+            for final in os.listdir(t_path):
+                f_path = os.path.join(t_path, final)
+                jid_file = os.path.join(f_path, 'jid')
+                if not os.path.isfile(jid_file):
+                    continue
+                with open(jid_file, 'r') as fn_:
+                    jid = fn_.read()
+                if len(jid) < 18:
+                    # Invalid jid, scrub the dir
+                    shutil.rmtree(f_path)
+                elif int(cur) - int(jid[:10]) > keep_jobs:
+                    shutil.rmtree(f_path)
+        try:
+            time.sleep(60)
+        except KeyboardInterrupt:
+            break
 
 class Master(SMaster):
     '''
@@ -121,34 +149,7 @@ class Master(SMaster):
         '''
         SMaster.__init__(self, opts)
 
-    def _clear_old_jobs(self):
-        '''
-        Clean out the old jobs
-        '''
-        if self.opts['keep_jobs'] == 0:
-            return
-        jid_root = os.path.join(self.opts['cachedir'], 'jobs')
-        while True:
-            cur = "{0:%Y%m%d%H}".format(datetime.datetime.now())
-
-            for top in os.listdir(jid_root):
-                t_path = os.path.join(jid_root, top)
-                for final in os.listdir(t_path):
-                    f_path = os.path.join(t_path, final)
-                    jid_file = os.path.join(f_path, 'jid')
-                    if not os.path.isfile(jid_file):
-                        continue
-                    with open(jid_file, 'r') as fn_:
-                        jid = fn_.read()
-                    if len(jid) < 18:
-                        # Invalid jid, scrub the dir
-                        shutil.rmtree(f_path)
-                    elif int(cur) - int(jid[:10]) > self.opts['keep_jobs']:
-                        shutil.rmtree(f_path)
-            try:
-                time.sleep(60)
-            except KeyboardInterrupt:
-                break
+    
 
     def start(self):
         '''
@@ -158,7 +159,7 @@ class Master(SMaster):
 
         log.warn('Starting the Salt Master')
         clear_old_jobs_proc = multiprocessing.Process(
-            target=self._clear_old_jobs)
+            target=_clear_old_jobs, args=[self.opts["keep_jobs"], self.opts["cachedir"]])
         clear_old_jobs_proc.start()
         reqserv = ReqServer(
                 self.opts,
@@ -207,6 +208,7 @@ class Publisher(multiprocessing.Process):
         '''
         Bind to the interface specified in the configuration file
         '''
+        log.info("Publisher starting run")
         # Set up the context
         context = zmq.Context(1)
         # Prepare minion publish socket
@@ -215,15 +217,22 @@ class Publisher(multiprocessing.Process):
         pub_uri = 'tcp://{0[interface]}:{0[publish_port]}'.format(self.opts)
         # Prepare minion pull socket
         pull_sock = context.socket(zmq.PULL)
-        pull_uri = 'ipc://{0}'.format(
+        if os.environ["os"].startswith("Windows"):
+            pull_uri = 'tcp://{0[interface]}:{0[publish_pull_port]}'.format(self.opts)
+        else:
+            pull_uri = 'ipc://{0}'.format(
                 os.path.join(self.opts['sock_dir'], 'publish_pull.ipc')
                 )
         # Start the minion command publisher
-        log.info('Starting the Salt Publisher on {0}'.format(pub_uri))
+        log.info('Starting the Salt Publisher on {0} {1}'.format(pub_uri, pull_uri))
+
         pub_sock.bind(pub_uri)
+
         pull_sock.bind(pull_uri)
+        log.info("Publisher OK")
         # Restrict access to the socket
-        os.chmod(
+        if not os.environ["os"].startswith("Windows"):
+            os.chmod(
                 os.path.join(self.opts['sock_dir'],
                     'publish_pull.ipc'),
                 448
@@ -252,42 +261,49 @@ class ReqServer(object):
     '''
     def __init__(self, opts, crypticle, key, mkey):
         self.opts = opts
-        self.master_key = mkey
+
+    def __config(self):
+        pseudoMaster = SMaster(self.opts)
+        self.master_key = pseudoMaster.master_key
         self.context = zmq.Context(self.opts['worker_threads'])
         # Prepare the zeromq sockets
         self.uri = 'tcp://%(interface)s:%(ret_port)s' % self.opts
         self.clients = self.context.socket(zmq.ROUTER)
         self.workers = self.context.socket(zmq.DEALER)
-        self.w_uri = 'ipc://{0}'.format(
+
+        if os.environ["os"].startswith("Windows"):
+            self.w_uri = 'tcp://%(interface)s:%(worker_port)s' % self.opts
+        else:
+            self.w_uri = 'ipc://{0}'.format(
             os.path.join(self.opts['sock_dir'], 'workers.ipc')
             )
         # Prepare the AES key
-        self.key = key
-        self.crypticle = crypticle
+        self.key = pseudoMaster.key
+        self.crypticle = pseudoMaster.crypticle
 
     def __bind(self):
         '''
         Binds the reply server
         '''
-        log.info('Setting up the master communication server')
+        log.info('Setting up the master communication server %s' % self.uri)
         self.clients.bind(self.uri)
+        log.info("Master communication server OK")
         self.work_procs = []
 
         for ind in range(int(self.opts['worker_threads'])):
-            self.work_procs.append(MWorker(self.opts,
-                    self.master_key,
-                    self.key,
-                    self.crypticle))
+            self.work_procs.append(MWorker(self.opts))
 
         for ind, proc in enumerate(self.work_procs):
             log.info('Starting Salt worker process {0}'.format(ind))
             proc.start()
 
         self.workers.bind(self.w_uri)
-
+        log.info("We're okay %s" % self.w_uri) 
         while True:
             try:
+                log.info("Predevicey")
                 zmq.device(zmq.QUEUE, self.clients, self.workers)
+                log.info("Devicey")
             except zmq.ZMQError as exc:
                 if exc.errno == errno.EINTR:
                     continue
@@ -314,6 +330,7 @@ class ReqServer(object):
         '''
         Start up the ReqServer
         '''
+        self.__config()
         self.__bind()
 
 
@@ -322,17 +339,16 @@ class MWorker(multiprocessing.Process):
     The worker multiprocess instance to manage the backend operations for the
     salt master.
     '''
-    def __init__(self,
-            opts,
-            mkey,
-            key,
-            crypticle):
+    def __init__(self, opts):
         multiprocessing.Process.__init__(self)
         self.opts = opts
-        self.serial = salt.payload.Serial(opts)
-        self.crypticle = crypticle
-        self.mkey = mkey
-        self.key = key
+
+    def __config(self):
+        self.serial = salt.payload.Serial(self.opts)
+        pseudoMaster = SMaster(self.opts)
+        self.crypticle = pseudoMaster.crypticle
+        self.mkey = pseudoMaster.master_key
+        self.key = pseudoMaster.key
 
     def __bind(self):
         '''
@@ -340,12 +356,15 @@ class MWorker(multiprocessing.Process):
         '''
         context = zmq.Context(1)
         socket = context.socket(zmq.REP)
-        w_uri = 'ipc://{0}'.format(
+        if os.environ["os"].startswith("Windows"):
+            self.w_uri = 'tcp://%(interface)s:%(worker_port)s' % self.opts
+        else:
+            self.w_uri = 'ipc://{0}'.format(
             os.path.join(self.opts['sock_dir'], 'workers.ipc')
             )
-        log.info('Worker binding to socket {0}'.format(w_uri))
+        log.info('Worker binding to socket {0}'.format(self.w_uri))
         try:
-            socket.connect(w_uri)
+            socket.connect(self.w_uri)
 
             while True:
                 try:
@@ -407,6 +426,7 @@ class MWorker(multiprocessing.Process):
         '''
         Start a Master Worker
         '''
+        self.__config()
         self.clear_funcs = ClearFuncs(
                 self.opts,
                 self.key,
@@ -425,7 +445,7 @@ class AESFuncs(object):
     def __init__(self, opts, crypticle):
         self.opts = opts
         self.event = salt.utils.event.SaltEvent(
-                self.opts['sock_dir'],
+                self.opts,
                 'master'
                 )
         self.serial = salt.payload.Serial(opts)
@@ -934,7 +954,7 @@ class ClearFuncs(object):
         self.crypticle = crypticle
         # Create the event manager
         self.event = salt.utils.event.SaltEvent(
-                self.opts['sock_dir'],
+                self.opts,
                 'master'
                 )
         # Make a client

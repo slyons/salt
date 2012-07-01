@@ -75,7 +75,7 @@ class LocalClient(object):
         self.serial = salt.payload.Serial(self.opts)
         self.key = self.__read_master_key()
         self.salt_user = self.__get_user()
-        self.event = salt.utils.event.MasterEvent(self.opts['sock_dir'])
+        self.event = salt.utils.event.MasterEvent(self.opts)
 
     def __read_master_key(self):
         '''

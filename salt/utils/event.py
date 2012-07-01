@@ -23,25 +23,34 @@ import zmq
 # Import Salt libs
 import salt.payload
 
+import logging
+
+log = logging.getLogger(__name__)
+
 class SaltEvent(object):
     '''
     The base class used to manage salt events
     '''
-    def __init__(self, sock_dir, node):
+    def __init__(self, opts, node):
         self.serial = salt.payload.Serial({'serial': 'msgpack'})
         self.context = zmq.Context()
         self.poller = zmq.Poller()
         self.cpub = False
         self.cpush = False
+        self.opts = opts
         if node == 'master':
-            self.puburi = 'ipc://{0}'.format(os.path.join(
-                    sock_dir,
-                    'master_event_pub.ipc'
-                    ))
-            self.pulluri = 'ipc://{0}'.format(os.path.join(
-                    sock_dir,
-                    'master_event_pull.ipc'
-                    ))
+            if os.environ["os"].startswith("Windows"):
+                self.puburi = 'tcp://%(interface)s:%(event_pub_port)s' % self.opts
+                self.pulluri = 'tcp://%(interface)s:%(event_pull_port)s' % self.opts
+            else:
+                self.puburi = 'ipc://{0}'.format(os.path.join(
+                        self.opts['sock_dir'],
+                        'master_event_pub.ipc'
+                        ))
+                self.pulluri = 'ipc://{0}'.format(os.path.join(
+                        self.opts['sock_dir'],
+                        'master_event_pull.ipc'
+                        ))
         else:
             self.puburi = 'ipc://{0}'.format(os.path.join(
                     sock_dir,
@@ -57,7 +66,9 @@ class SaltEvent(object):
         Establish the publish connection
         '''
         self.sub = self.context.socket(zmq.SUB)
+        log.info("Starting an event publisher on %s" % self.puburi)
         self.sub.connect(self.puburi)
+        log.info("Event publisher started")
         self.poller.register(self.sub, zmq.POLLIN)
         self.cpub = True
 
@@ -66,7 +77,9 @@ class SaltEvent(object):
         Establish a connection with the event pull socket
         '''
         self.push = self.context.socket(zmq.PUSH)
+        log.info("Starting an event puller on %s" % self.pulluri)
         self.push.connect(self.pulluri)
+        log.info("Event puller started")
         self.cpush = True
 
     def get_event(self, wait=5, tag='', full=False):
@@ -146,28 +159,38 @@ class EventPublisher(multiprocessing.Process):
         context = zmq.Context(1)
         # Prepare the master event publisher
         epub_sock = context.socket(zmq.PUB)
-        epub_uri = 'ipc://{0}'.format(
-                os.path.join(self.opts['sock_dir'], 'master_event_pub.ipc')
-                )
         # Prepare master event pull socket
         epull_sock = context.socket(zmq.PULL)
-        epull_uri = 'ipc://{0}'.format(
+
+        if os.environ["os"].startswith("Windows"):
+            epub_uri = 'tcp://%(interface)s:%(master_event_pub_port)s' % self.opts
+            epull_uri = 'tcp://%(interface)s:%(master_event_pull_port)s' % self.opts
+        else:
+            epub_uri = 'ipc://{0}'.format(
+                os.path.join(self.opts['sock_dir'], 'master_event_pub.ipc')
+                )
+            epull_uri = 'ipc://{0}'.format(
                 os.path.join(self.opts['sock_dir'], 'master_event_pull.ipc')
                 )
-        # Start the master event publisher
-        epub_sock.bind(epub_uri)
-        epull_sock.bind(epull_uri)
-        # Restrict access to the sockets
-        os.chmod(
+
+            # Restrict access to the sockets
+            os.chmod(
                 os.path.join(self.opts['sock_dir'],
                     'master_event_pub.ipc'),
                 448
                 )
-        os.chmod(
+            os.chmod(
                 os.path.join(self.opts['sock_dir'],
                     'master_event_pull.ipc'),
                 448
                 )
+
+        # Start the master event publisher
+        try:
+            epub_sock.bind(epub_uri)
+            epull_sock.bind(epull_uri)
+        except Exception, e:
+            print e
 
         try:
             while True:
